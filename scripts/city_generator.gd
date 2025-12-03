@@ -2,11 +2,16 @@ extends Node2D
 
 # City parameters
 @export var city_size := Vector2(800, 800)
-@export var block_size := Vector2(40, 40)
 @export var road_width := 6.0
 @export var sidewalk_width := 2.0
 @export var building_density := 0.9
 @export var seed_value := 0
+
+# Zone parameters for organic layout
+@export var center_grid_spacing := 40.0  # Regular grid in city center
+@export var middle_block_length := 80.0  # Longer blocks in middle zone
+@export var periphery_road_density := 0.3  # Sparse roads on periphery
+@export var max_bridges := 3  # Maximum number of river crossings
 
 # Agent parameters
 @export var num_agents := 50
@@ -44,6 +49,48 @@ const COLORS = {
 # Building types
 enum BuildingType { RESIDENTIAL, COMMERCIAL, INDUSTRIAL, OFFICE, SCHOOL, HOSPITAL, CHURCH, POLICE_STATION, FIRE_STATION }
 enum NeighborhoodType { NONE, LITTLE_ITALY, CHINATOWN, DOWNTOWN }
+
+# Data structures for organic road network
+class Road:
+	var start: Vector2
+	var end: Vector2
+	var width: float
+	func _init(s: Vector2, e: Vector2, w: float = 6.0):
+		start = s; end = e; width = w
+	func get_center() -> Vector2:
+		return (start + end) / 2.0
+	func get_direction() -> Vector2:
+		return (end - start).normalized()
+	func get_length() -> float:
+		return start.distance_to(end)
+
+class Block:
+	var vertices: Array[Vector2] = []
+	var center: Vector2
+	var area: float
+	func _init(verts: Array[Vector2]):
+		vertices = verts
+		center = calculate_center()
+		area = calculate_area()
+	func calculate_center() -> Vector2:
+		var sum := Vector2.ZERO
+		for v in vertices:
+			sum += v
+		return sum / vertices.size() if vertices.size() > 0 else Vector2.ZERO
+	func calculate_area() -> float:
+		var a := 0.0
+		for i in range(vertices.size()):
+			var j := (i + 1) % vertices.size()
+			a += vertices[i].x * vertices[j].y - vertices[j].x * vertices[i].y
+		return abs(a) / 2.0
+	func contains_point(p: Vector2) -> bool:
+		var count := 0
+		for i in range(vertices.size()):
+			var j := (i + 1) % vertices.size()
+			if ((vertices[i].y > p.y) != (vertices[j].y > p.y)) and \
+			   (p.x < (vertices[j].x - vertices[i].x) * (p.y - vertices[i].y) / (vertices[j].y - vertices[i].y) + vertices[i].x):
+				count += 1
+		return count % 2 == 1
 
 # Data structures
 class Building:
@@ -93,6 +140,9 @@ var agents: Array[Agent] = []
 var neighborhoods: Array[Neighborhood] = []
 var rivers: Array = []
 var bridges: Array = []
+var roads: Array[Road] = []
+var blocks: Array[Block] = []
+var intersections: Array[Vector2] = []
 var institutional_positions: Array[Vector2] = []
 var parks: Array = []
 var park_blocks: Dictionary = {}  # Using Dictionary for O(1) lookup instead of Array
@@ -171,7 +221,7 @@ func _unhandled_input(event):
 			print("Camera centered")
 
 func generate_city():
-	print("Generating city...")
+	print("Generating city with organic layout...")
 	if seed_value != 0:
 		rng.seed = seed_value
 	else:
@@ -182,6 +232,9 @@ func generate_city():
 	neighborhoods.clear()
 	rivers.clear()
 	bridges.clear()
+	roads.clear()
+	blocks.clear()
+	intersections.clear()
 	institutional_positions.clear()
 	parks.clear()
 	park_blocks.clear()
@@ -193,7 +246,9 @@ func generate_city():
 
 	generate_neighborhoods()
 	gen_rivers()
-	gen_bridges()
+	gen_organic_road_network()  # New organic road generation
+	gen_bridges_perpendicular()  # Updated bridge generation
+	gen_blocks_from_roads()  # Create blocks from road network
 	gen_parks()
 	gen_buildings()
 	draw_static_city()
@@ -244,6 +299,188 @@ func gen_rivers():
 			points.append(Vector2(x, y))
 
 	rivers.append(points)
+
+func gen_organic_road_network():
+	"""Generate organic road network with grid in center, irregular in middle, curved on periphery"""
+	var center := city_size / 2
+	var max_dist := city_size.length() / 2
+
+	# 1. Generate city center grid (regular, dense)
+	var grid_radius := max_dist * 0.3
+	var spacing := center_grid_spacing
+	var grid_start := center - Vector2(grid_radius, grid_radius)
+	var grid_end := center + Vector2(grid_radius, grid_radius)
+
+	# Vertical roads in center
+	var x := grid_start.x
+	while x <= grid_end.x:
+		roads.append(Road.new(Vector2(x, grid_start.y), Vector2(x, grid_end.y), road_width))
+		x += spacing
+
+	# Horizontal roads in center
+	var y := grid_start.y
+	while y <= grid_end.y:
+		roads.append(Road.new(Vector2(grid_start.x, y), Vector2(grid_end.x, y), road_width))
+		y += spacing
+
+	# 2. Generate middle zone (longer, irregular blocks)
+	var middle_inner := max_dist * 0.3
+	var middle_outer := max_dist * 0.65
+	gen_middle_zone_roads(center, middle_inner, middle_outer)
+
+	# 3. Generate periphery (curved, sparse roads)
+	var periphery_inner := max_dist * 0.65
+	gen_periphery_roads(center, periphery_inner, max_dist)
+
+	# 4. Add some radial roads connecting zones
+	gen_radial_roads(center, max_dist)
+
+	print("Generated ", roads.size(), " road segments")
+
+func gen_middle_zone_roads(center: Vector2, inner_radius: float, outer_radius: float):
+	"""Generate irregular, longer blocks in the middle zone"""
+	var num_rings := 4
+
+	for ring in range(num_rings):
+		var ring_radius := inner_radius + (outer_radius - inner_radius) * (ring / float(num_rings))
+		var circumference := 2 * PI * ring_radius
+		var num_segments := int(circumference / middle_block_length)
+
+		for i in range(num_segments):
+			var angle1 := (i / float(num_segments)) * TAU
+			var angle2 := ((i + 1) / float(num_segments)) * TAU
+
+			# Add some irregularity
+			var offset1 := rng.randf_range(-0.1, 0.1) * middle_block_length
+			var offset2 := rng.randf_range(-0.1, 0.1) * middle_block_length
+
+			var r1 := ring_radius + offset1
+			var r2 := ring_radius + offset2
+
+			var p1 := center + Vector2(cos(angle1), sin(angle1)) * r1
+			var p2 := center + Vector2(cos(angle2), sin(angle2)) * r2
+
+			# Tangential road segments
+			if rng.randf() > 0.3:  # Skip some for irregularity
+				roads.append(Road.new(p1, p2, road_width))
+
+		# Add some radial connections
+		if ring > 0 and rng.randf() > 0.5:
+			var angle := rng.randf() * TAU
+			var inner_r := inner_radius + (outer_radius - inner_radius) * ((ring - 1) / float(num_rings))
+			var p_inner := center + Vector2(cos(angle), sin(angle)) * inner_r
+			var p_outer := center + Vector2(cos(angle), sin(angle)) * ring_radius
+			roads.append(Road.new(p_inner, p_outer, road_width))
+
+func gen_periphery_roads(center: Vector2, inner_radius: float, outer_radius: float):
+	"""Generate sparse, curved roads on the periphery"""
+	var num_curves := int(8 * periphery_road_density)
+
+	for i in range(num_curves):
+		var angle := (i / float(num_curves)) * TAU + rng.randf_range(-0.2, 0.2)
+		var curve_points: Array[Vector2] = []
+		var num_points := rng.randi_range(4, 8)
+
+		for j in range(num_points):
+			var t := j / float(num_points - 1)
+			var r := lerp(inner_radius, outer_radius, t)
+			var a := angle + sin(t * PI * 2) * 0.3 + rng.randf_range(-0.15, 0.15)
+			curve_points.append(center + Vector2(cos(a), sin(a)) * r)
+
+		# Create road segments from curve points
+		for j in range(curve_points.size() - 1):
+			roads.append(Road.new(curve_points[j], curve_points[j + 1], road_width * 0.8))
+
+func gen_radial_roads(center: Vector2, max_radius: float):
+	"""Add major radial roads connecting center to periphery"""
+	var num_radials := rng.randi_range(6, 10)
+
+	for i in range(num_radials):
+		var angle := (i / float(num_radials)) * TAU + rng.randf_range(-0.1, 0.1)
+		var start_r := max_radius * 0.25
+		var end_r := max_radius * 0.9
+
+		var start := center + Vector2(cos(angle), sin(angle)) * start_r
+		var end := center + Vector2(cos(angle), sin(angle)) * end_r
+
+		roads.append(Road.new(start, end, road_width * 1.2))
+
+func gen_bridges_perpendicular():
+	"""Generate fewer bridges that cross perpendicular to the river"""
+	if rivers.is_empty():
+		return
+
+	var river := rivers[0]
+	var river_length := 0.0
+	for i in range(river.size() - 1):
+		river_length += river[i].distance_to(river[i + 1])
+
+	var bridge_spacing := river_length / (max_bridges + 1)
+	var current_length := 0.0
+	var bridges_created := 0
+
+	for i in range(river.size() - 1):
+		if bridges_created >= max_bridges:
+			break
+
+		var seg_start := river[i]
+		var seg_end := river[i + 1]
+		var seg_length := seg_start.distance_to(seg_end)
+
+		# Check if we should place a bridge in this segment
+		while current_length + seg_length >= bridge_spacing * (bridges_created + 1) and bridges_created < max_bridges:
+			var t := (bridge_spacing * (bridges_created + 1) - current_length) / seg_length
+			var bridge_point := seg_start.lerp(seg_end, t)
+
+			# Get river direction and perpendicular
+			var river_dir := (seg_end - seg_start).normalized()
+			var perpendicular := Vector2(-river_dir.y, river_dir.x)
+
+			# Create bridge perpendicular to river
+			var bridge_length := 40.0
+			var b_start := bridge_point - perpendicular * bridge_length / 2
+			var b_end := bridge_point + perpendicular * bridge_length / 2
+
+			bridges.append([b_start, b_end])
+			bridges_created += 1
+
+		current_length += seg_length
+
+	print("Generated ", bridges.size(), " bridges")
+
+func gen_blocks_from_roads():
+	"""Create block polygons from the road network intersections"""
+	# For now, use a simplified approach: create blocks based on road proximity
+	# A full implementation would use a planar graph subdivision algorithm
+
+	# This is a placeholder - in a full implementation, you'd:
+	# 1. Find all road intersections
+	# 2. Build a graph of connected road segments
+	# 3. Find all cycles in the graph to identify enclosed blocks
+	# 4. Create Block objects from these cycles
+
+	# Simplified: Create rectangular approximations in grid areas
+	var center := city_size / 2
+	var grid_radius := (city_size.length() / 2) * 0.3
+	var spacing := center_grid_spacing
+	var grid_start := center - Vector2(grid_radius, grid_radius)
+	var grid_end := center + Vector2(grid_radius, grid_radius)
+
+	var x := grid_start.x
+	while x < grid_end.x - spacing:
+		var y := grid_start.y
+		while y < grid_end.y - spacing:
+			var verts: Array[Vector2] = [
+				Vector2(x + road_width, y + road_width),
+				Vector2(x + spacing - road_width, y + road_width),
+				Vector2(x + spacing - road_width, y + spacing - road_width),
+				Vector2(x + road_width, y + spacing - road_width)
+			]
+			blocks.append(Block.new(verts))
+			y += spacing
+		x += spacing
+
+	print("Generated ", blocks.size(), " blocks")
 
 func gen_bridges():
 	var cols := int(city_size.x / block_size.x)
@@ -322,16 +559,85 @@ func is_park_block(col: int, row: int) -> bool:
 	return block_pos in park_blocks
 
 func gen_buildings():
-	var cols := int(city_size.x / block_size.x)
-	var rows := int(city_size.y / block_size.y)
+	# Generate buildings within each block
+	for block in blocks:
+		if block.area < 100:  # Skip very small blocks
+			continue
 
-	for i in range(cols):
-		for j in range(rows):
-			if is_in_river(i, j) or is_park_block(i, j):
-				continue
+		# Check if block is in river or park
+		if is_block_in_river(block) or is_block_in_park(block):
+			continue
 
-			if rng.randf() < building_density:
-				gen_block(i, j)
+		if rng.randf() < building_density:
+			gen_buildings_in_block(block)
+
+func is_block_in_river(block: Block) -> bool:
+	"""Check if block overlaps with river"""
+	for river in rivers:
+		for i in range(river.size() - 1):
+			if dist_to_seg(block.center, river[i], river[i + 1]) < 35:
+				return true
+	return false
+
+func is_block_in_park(block: Block) -> bool:
+	"""Check if block is designated as a park"""
+	# For now, return false - we'll update park generation later
+	return false
+
+func gen_buildings_in_block(block: Block):
+	"""Generate buildings within a block polygon"""
+	# Get the bounding box of the block
+	var min_x := INF
+	var min_y := INF
+	var max_x := -INF
+	var max_y := -INF
+
+	for v in block.vertices:
+		min_x = min(min_x, v.x)
+		min_y = min(min_y, v.y)
+		max_x = max(max_x, v.x)
+		max_y = max(max_y, v.y)
+
+	var block_size_vec := Vector2(max_x - min_x, max_y - min_y)
+
+	# Add margin for sidewalks
+	var margin := 3.0
+	var building_area := Rect2(
+		Vector2(min_x + margin, min_y + margin),
+		Vector2(block_size_vec.x - margin * 2, block_size_vec.y - margin * 2)
+	)
+
+	if building_area.size.x < 5 or building_area.size.y < 5:
+		return
+
+	# Determine building type based on location
+	var type := get_building_type_by_pos(block.center)
+	var hood := get_neighborhood(block.center)
+
+	# For institutional buildings, create one large building
+	if type in [BuildingType.SCHOOL, BuildingType.HOSPITAL, BuildingType.CHURCH, BuildingType.POLICE_STATION, BuildingType.FIRE_STATION]:
+		institutional_positions.append(block.center)
+		var rect := Rect2(building_area.position + Vector2(2, 2), building_area.size - Vector2(4, 4))
+		buildings.append(Building.new(rect, type, get_height(type), get_color(type, hood)))
+		return
+
+	# For regular buildings, subdivide the block
+	var num_subdivisions := rng.randi_range(1, 4)
+	if block.area > 1000:
+		num_subdivisions = rng.randi_range(2, 6)
+
+	if num_subdivisions == 1:
+		var rect := Rect2(building_area.position + Vector2(2, 2), building_area.size - Vector2(4, 4))
+		buildings.append(Building.new(rect, type, get_height(type), get_color(type, hood)))
+	else:
+		var grid := 2 if num_subdivisions <= 4 else 3
+		var b_size := building_area.size / grid
+		for i in range(grid):
+			for j in range(grid):
+				if rng.randf() < 0.75:
+					var b_pos := building_area.position + Vector2(i * b_size.x + 1, j * b_size.y + 1)
+					var rect := Rect2(b_pos, b_size - Vector2(2, 2))
+					buildings.append(Building.new(rect, type, get_height(type), get_color(type, hood)))
 
 func gen_block(col: int, row: int):
 	var pos := Vector2(col * block_size.x + road_width, row * block_size.y + road_width)
@@ -358,6 +664,39 @@ func gen_block(col: int, row: int):
 					var b_pos := pos + Vector2(i * b_size.x + 1, j * b_size.y + 1)
 					var rect := Rect2(b_pos, b_size - Vector2(2, 2))
 					buildings.append(Building.new(rect, type, get_height(type), get_color(type, hood)))
+
+func get_building_type_by_pos(pos: Vector2) -> BuildingType:
+	"""Get building type based on position in city"""
+	var hood := get_neighborhood(pos)
+	var r := rng.randf()
+
+	if hood:
+		match hood.type:
+			NeighborhoodType.DOWNTOWN:
+				return BuildingType.OFFICE if r < 0.5 else (BuildingType.COMMERCIAL if r < 0.85 else BuildingType.RESIDENTIAL)
+			NeighborhoodType.LITTLE_ITALY:
+				return BuildingType.RESIDENTIAL if r < 0.65 else (BuildingType.COMMERCIAL if r < 0.9 else BuildingType.CHURCH)
+			NeighborhoodType.CHINATOWN:
+				return BuildingType.RESIDENTIAL if r < 0.55 else BuildingType.COMMERCIAL
+
+	# Check proximity to institutional buildings
+	for ipos in institutional_positions:
+		if pos.distance_to(ipos) < 80 and rng.randf() < 0.05:
+			return [BuildingType.SCHOOL, BuildingType.CHURCH, BuildingType.HOSPITAL, BuildingType.POLICE_STATION, BuildingType.FIRE_STATION][rng.randi() % 5]
+
+	# Distance-based distribution
+	var center := city_size / 2
+	var dist := pos.distance_to(center) / (city_size.length() / 2)
+
+	if dist < 0.3:
+		return BuildingType.COMMERCIAL if r < 0.4 else (BuildingType.OFFICE if r < 0.8 else BuildingType.RESIDENTIAL)
+	elif dist < 0.6:
+		if r < 0.3: return BuildingType.COMMERCIAL
+		elif r < 0.5: return BuildingType.OFFICE
+		elif r < 0.8: return BuildingType.RESIDENTIAL
+		else: return BuildingType.INDUSTRIAL
+	else:
+		return BuildingType.RESIDENTIAL if r < 0.5 else (BuildingType.INDUSTRIAL if r < 0.8 else BuildingType.COMMERCIAL)
 
 func get_building_type(col: int, row: int) -> BuildingType:
 	var pos := Vector2(col * block_size.x, row * block_size.y)
@@ -479,18 +818,11 @@ func _draw_static():
 		static_canvas.draw_line(bridge[0], bridge[1], COLORS.bridge, road_width + 2)
 		static_canvas.draw_line(bridge[0], bridge[1], COLORS.road, road_width)
 
-	var cols := int(city_size.x / block_size.x)
-	var rows := int(city_size.y / block_size.y)
-
-	for i in range(cols + 1):
-		var x := i * block_size.x
-		static_canvas.draw_line(Vector2(x, 0), Vector2(x, city_size.y), COLORS.sidewalk, road_width + sidewalk_width * 2)
-		static_canvas.draw_line(Vector2(x, 0), Vector2(x, city_size.y), COLORS.road, road_width)
-
-	for j in range(rows + 1):
-		var y := j * block_size.y
-		static_canvas.draw_line(Vector2(0, y), Vector2(city_size.x, y), COLORS.sidewalk, road_width + sidewalk_width * 2)
-		static_canvas.draw_line(Vector2(0, y), Vector2(city_size.x, y), COLORS.road, road_width)
+	# Draw organic road network
+	for road in roads:
+		var w := road.width
+		static_canvas.draw_line(road.start, road.end, COLORS.sidewalk, w + sidewalk_width * 2)
+		static_canvas.draw_line(road.start, road.end, COLORS.road, w)
 
 	for building in buildings:
 		for i in range(building.height):
@@ -573,30 +905,54 @@ func update_agents(delta: float):
 		agent_canvas.queue_redraw()
 
 func find_path(start: Vector2, end: Vector2) -> Array[Vector2]:
+	"""Simplified pathfinding for organic road network"""
 	var path: Array[Vector2] = []
-	var sg: Vector2 = (start / block_size).round()
-	var eg: Vector2 = (end / block_size).round()
+	var center := city_size / 2
+	var max_dist := city_size.length() / 2
+
+	# Check if we're in the grid area (center)
+	var start_dist := start.distance_to(center) / max_dist
+	var end_dist := end.distance_to(center) / max_dist
+
+	# If both points are in the grid area, use grid-based pathfinding
+	if start_dist < 0.3 and end_dist < 0.3:
+		return find_path_grid(start, end)
+
+	# Otherwise, use simplified direct path with waypoints
+	# Add waypoint at center if crossing zones
+	if start_dist > 0.4 or end_dist > 0.4:
+		var direction := (end - start).normalized()
+		var distance := start.distance_to(end)
+		var num_waypoints := int(distance / 100.0)  # Add waypoint every 100 units
+
+		for i in range(1, num_waypoints + 1):
+			var t := i / float(num_waypoints + 1)
+			path.append(start.lerp(end, t))
+
+	path.append(end)
+	return path
+
+func find_path_grid(start: Vector2, end: Vector2) -> Array[Vector2]:
+	"""Grid-based pathfinding for center area"""
+	var path: Array[Vector2] = []
+	var spacing := center_grid_spacing
+	var sg: Vector2 = (start / spacing).round()
+	var eg: Vector2 = (end / spacing).round()
 	var cur: Vector2 = sg
 	var sidewalk_offset := (road_width / 2) + (sidewalk_width / 2)
 
+	# Move horizontally first
 	while cur.x != eg.x:
 		cur.x += 1 if cur.x < eg.x else -1
-		var pos := cur * block_size
-
-		if is_park_block(int(cur.x), int(cur.y)):
-			pos = cur * block_size + block_size / 2
-		else:
-			pos.y += sidewalk_offset if cur.y < eg.y else -sidewalk_offset
+		var pos := cur * spacing
+		pos.y += sidewalk_offset if cur.y < eg.y else -sidewalk_offset
 		path.append(pos)
 
+	# Then move vertically
 	while cur.y != eg.y:
 		cur.y += 1 if cur.y < eg.y else -1
-		var pos := cur * block_size
-
-		if is_park_block(int(cur.x), int(cur.y)):
-			pos = cur * block_size + block_size / 2
-		else:
-			pos.x += sidewalk_offset if cur.x < eg.x else -sidewalk_offset
+		var pos := cur * spacing
+		pos.x += sidewalk_offset
 		path.append(pos)
 
 	path.append(end)
